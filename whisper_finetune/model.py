@@ -11,11 +11,11 @@ from transformers import (
 from .dataset import WhisperASRDataset, WhisperASRDataCollator
 
 class WhisperModelModule(LightningModule):
-    def __init__(self, config, model_name="base", lang="ja", train_dataset=[], eval_dataset=[]) -> None:
+    def __init__(self, config, model_name, lang, train_dataset=[], eval_dataset=[]) -> None:
         super().__init__()
         self.options = whisper.DecodingOptions(language=lang, without_timestamps=True)
         self.model = whisper.load_model(model_name)
-        self.tokenizer = whisper.tokenizer.get_tokenizer(True, language="ja", task=self.options.task)
+        self.tokenizer = whisper.tokenizer.get_tokenizer(True, language, task=self.options.task)
 
         # only decoder training
         for p in self.model.encoder.parameters():
