@@ -11,19 +11,20 @@ from transformers import (
 from .dataset import WhisperASRDataset, WhisperASRDataCollator
 
 class WhisperModelModule(LightningModule):
-    def __init__(self, config, model_name, lang, train_dataset=[], eval_dataset=[]) -> None:
+    def __init__(self, config, model_name, lang, train_dataset=[], eval_dataset=[], epochs=0, steps_per_epoch=0) -> None:
         super().__init__()
         self.options = whisper.DecodingOptions(language=lang, without_timestamps=True)
         self.model = whisper.load_model(model_name)
-        self.tokenizer = whisper.tokenizer.get_tokenizer(True, language, task=self.options.task)
-
+        self.tokenizer = whisper.tokenizer.get_tokenizer(True, language=lang, task=self.options.task)
+        self.epochs = epochs
+        self.steps_per_epoch = steps_per_epoch
         # only decoder training
         for p in self.model.encoder.parameters():
             p.requires_grad = False
         
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-        self.metrics_wer = evaluate.load("wer")
-        self.metrics_cer = evaluate.load("cer")
+        # self.metrics_wer = evaluate.load("wer")
+        # self.metrics_cer = evaluate.load("cer")
 
         self.config = config
         self.__train_dataset = train_dataset
@@ -32,48 +33,72 @@ class WhisperModelModule(LightningModule):
     def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch, batch_id):
+
+    def training_step_single_loader(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         labels = batch["labels"].long()
         dec_input_ids = batch["dec_input_ids"].long()
 
-        with torch.no_grad():
-            audio_features = self.model.encoder(input_ids)
+        # with torch.no_grad():
+        audio_features = self.model.encoder(input_ids)
 
         out = self.model.decoder(dec_input_ids, audio_features)
         loss = self.loss_fn(out.view(-1, out.size(-1)), labels.view(-1))
+        return loss
+        # self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True)
+        # return loss
+
+
+    def training_step_double_loader(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        labels = batch["labels"].long()
+        dec_input_ids = batch["dec_input_ids"].long()
+        out = self.model.decoder(dec_input_ids, None)
+        loss = self.loss_fn(out.view(-1, out.size(-1)), labels.view(-1))
+        return loss
+
+
+    def training_step(self, batch, batch_idx):
+        if type(batch) == list:
+            audio_loss = self.training_step_single_loader(batch[0], batch_idx)
+            text_loss = self.training_step_double_loader(batch[1], batch_idx)
+            loss = audio_loss + text_loss
+        else:
+            loss = self.training_step_single_loader(batch, batch_idx)
         self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True)
         return loss
+    # def training_step(self, batch, batch_id):
+
+    #     input_ids = batch["input_ids"]
+    #     labels = batch["labels"].long()
+    #     dec_input_ids = batch["dec_input_ids"].long()
+
+    #     if input_ids.nelements():
+    #         with torch.no_grad():
+    #             audio_features = self.model.encoder(input_ids)
+
+    #         out = self.model.decoder(dec_input_ids, audio_features)
+    #     else:
+    #         out = self.model.decoder(dec_input_ids, None)
+    #     loss = self.loss_fn(out.view(-1, out.size(-1)), labels.view(-1))
+    #     self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True)
+    #     return loss
     
     def validation_step(self, batch, batch_id):
         input_ids = batch["input_ids"]
         labels = batch["labels"].long()
         dec_input_ids = batch["dec_input_ids"].long()
 
-
+        # print(input_ids, flush=True)
+        # print(input_ids.nelement(), flush=True)
         audio_features = self.model.encoder(input_ids)
         out = self.model.decoder(dec_input_ids, audio_features)
 
         loss = self.loss_fn(out.view(-1, out.size(-1)), labels.view(-1))
 
-        out[out == -100] = self.tokenizer.eot
-        labels[labels == -100] = self.tokenizer.eot
-
-        o_list, l_list = [], []
-        for o, l in zip(out, labels):
-            o = torch.argmax(o, dim=1)
-            o_list.append(self.tokenizer.decode(o, skip_special_tokens=True))
-            l_list.append(self.tokenizer.decode(l, skip_special_tokens=True))
-        cer = self.metrics_cer.compute(references=l_list, predictions=o_list)
-        wer = self.metrics_wer.compute(references=l_list, predictions=o_list)
-
         self.log("val/loss", loss, on_step=True, prog_bar=True, logger=True)
-        self.log("val/cer", cer, on_step=True, prog_bar=True, logger=True)
-        self.log("val/wer", wer, on_step=True, prog_bar=True, logger=True)
 
         return {
-            "cer": cer,
-            "wer": wer,
             "loss": loss
         }
 
@@ -98,10 +123,19 @@ class WhisperModelModule(LightningModule):
                     )
         self.optimizer = optimizer
 
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=self.config["warmup_steps"], 
-            num_training_steps=self.t_total
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            self.config["learning_rate"], 
+            pct_start=0.1, 
+            steps_per_epoch=self.steps_per_epoch, 
+            epochs=self.epochs, 
+            anneal_strategy="linear"
         )
+
+        # scheduler = get_linear_schedule_with_warmup(
+        #     optimizer, num_warmup_steps=self.config["warmup_steps"], 
+        #     num_training_steps=self.t_total
+        # )
         self.scheduler = scheduler
 
         return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
@@ -115,19 +149,19 @@ class WhisperModelModule(LightningModule):
                 * float(self.config["num_train_epochs"])
             )
     
-    def train_dataloader(self):
-        dataset = WhisperASRDataset(self.__train_dataset, self.tokenizer)
-        return torch.utils.data.DataLoader(dataset, 
-                    batch_size=self.config["batch_size"], 
-                    drop_last=True, shuffle=True, num_workers=self.config["num_worker"],
-                    collate_fn=WhisperASRDataCollator()
-                )
+    # def train_dataloader(self):
+    #     dataset = WhisperASRDataset(self.__train_dataset, self.tokenizer)
+    #     return torch.utils.data.DataLoader(dataset, 
+    #                 batch_size=self.config["batch_size"], 
+    #                 drop_last=True, shuffle=True, num_workers=self.config["num_worker"],
+    #                 collate_fn=WhisperASRDataCollator()
+    #             )
 
-    def val_dataloader(self):
-        dataset = WhisperASRDataset(self.__eval_dataset, self.tokenizer)
-        return torch.utils.data.DataLoader(dataset, 
-                    batch_size=self.config["batch_size"], 
-                    num_workers=self.config["num_worker"],
-                    collate_fn=WhisperASRDataCollator()
-                )
+    # def val_dataloader(self):
+    #     dataset = WhisperASRDataset(self.__eval_dataset, self.tokenizer)
+    #     return torch.utils.data.DataLoader(dataset, 
+    #                 batch_size=self.config["batch_size"], 
+    #                 num_workers=self.config["num_worker"],
+    #                 collate_fn=WhisperASRDataCollator()
+    #             )
     
